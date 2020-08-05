@@ -1,74 +1,131 @@
-import pandas as pd
-from sklearn.model_selection import train_test_split
+import torch
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from transformers import BertTokenizer, BertForSequenceClassification, BertConfig, AdamW, WarmupLinearSchedule
+
+import csv
+import json
 import numpy as np
-from sklearn.utils import shuffle
-'''bath_list=['6_2','6_3','6_4','6_5','6_6','6_7','6_8','6_9']
-for bath in bath_list:
-    df1 = pd.DataFrame(pd.read_excel('test/true_%s.xlsx'%bath))
+import pandas as pd
 
-    df2 = pd.DataFrame(pd.read_excel('test/flase_%s.xlsx'%bath))
-
-
-    id_true=list(set(df1['order_display_id'].values))
-    id_flase=list(set(df2['order_display_id'].values))
-    print(len(id_true),len(id_flase),len(id_true)+len(id_flase))
-    df1['msg_content']=df1['msg_content'].astype("str")
-    df1 = df1[True^df1['msg_content'].str.contains(r'.*?im.*')]
-    df1 = df1['msg_content'].groupby(df1['order_display_id']).agg("/temp/".join).tolist()
-    df2['im']=df2['im'].astype("str")
-    df2 = df2[True^df2['im'].str.contains(r'.*?im.*')]
-    df2 = df2['im'].groupby(df2['order_display_id']).agg("/temp/".join).tolist()
-
-    print('zhen',len(df1),'jia',len(df2))
-    x=df1+df2
-    print(len(x))
-
-    y=[0 for i in range(len(df1))]+[1 for j in range(len(df2))]
-
-    #x_train, x_test, y_train,y_test = train_test_split(x, y, test_size=0.2)
-    #print(len(x_train),len(x_test),y_test)
-    train = pd.DataFrame({'id':[i for i in range(len(x))],'im':x,'label':y})
-    #test = pd.DataFrame({'id':[i for i in range(len(x_test))],'im':x_test,'label':y_test})
-
-    train.to_csv(bath+'.csv', encoding='utf-8',index=False)
-    #test.to_csv('test.csv', encoding='utf-8',index=False)'''
-def undeee(a):
-    b = str(a)
-    b = b.replace('[', '')
-    b = b.replace(']', '')
-    a = list(eval(b))
-    return a
-
-img_pth=np.array([])
-ocr_text=np.array([])
-dfid = pd.DataFrame(pd.read_excel('OCR_id_8.3.xlsx'))
-df_c = pd.DataFrame(pd.read_excel('OCR_TEST2.xlsx'))
-order_display_id=dfid['order_display_id'].values
-id=[]
-im=dfid['msg_content'].values
-img_pth_c=df_c['im_pth'].values
-predict_c=df_c['predict'].values
-predict_c_dl=df_c['predict_dl'].values
-predict=[]
-predict_dl=[]
-for bath in [1,2,3,4,5,6,7,8]:
-    df1 = pd.DataFrame(pd.read_excel('chineseocr_lite-OCRThread-%s.xlsx'%bath))
-    img_pth=np.append(img_pth,df1['img_name'].values)
-    ocr_text=np.append(ocr_text, df1['ocr内容'].values)
-for i in img_pth:
-    print(i[1:])
-    try:
-        index=np.argwhere(im==i[1:])[0][0]
-        id.append(order_display_id[index])
-        index_2=np.argwhere(img_pth_c==i)[0][0]
-        predict.append(predict_c[index_2])
-        predict_dl.append(predict_c_dl[index_2])
-        print(i)
-    except:
-        print('none')
+# 超参数
+EPOCHS = 10  # 训练的轮数
+BATCH_SIZE = 100  # 批大小
+MAX_LEN = 140  # 文本最大长度
+LR = 1e-5  # 学习率
+WARMUP_STEPS = 100  # 热身步骤
+T_TOTAL = 1000  # 总步骤
 
 
-print(img_pth)
-print(ocr_text)
-df=pd.DataFrame({'img_pth':img_pth,'ocr_text':ocr_text,'predict':predict,'predict_dl':predict_dl,'order_display_id':id,'dt':["2020-08-02" for i in range(len(img_pth))]})
-df.to_excel('result_OCzr——8.3.xlsx', index=False)
+# pytorch的dataset类 重写getitem,len方法
+class Custom_dataset(Dataset):
+    def __init__(self, dataset_list):
+        self.dataset = dataset_list
+
+    def __getitem__(self, item):
+        text = self.dataset[item][1]
+        label = self.dataset[item][2]
+
+        return text, label
+
+    def __len__(self):
+        return len(self.dataset)
+
+
+# 加载数据集
+def load_dataset(filepath, max_len):
+    dataset_list = []
+    f = open(filepath, 'r', encoding='utf-8')
+    dicr = csv.DictReader(f)
+    for i in dicr:
+        if i['id'] != None and i['im'] != None :
+            dataset_list.append([i['id'], i['im']])
+    # 根据max_len参数进行padding
+    tokenizer = BertTokenizer.from_pretrained('bert-base-chinese', resume_download=True)
+    for item in dataset_list:
+        print(item)
+        item[1] = item[1].replace('/temp/', '\n')
+        num = max_len - len(item[1])
+        if num < 0:
+            item[1] = item[1][:max_len]
+            item[1] = tokenizer.encode(item[1])
+            num_temp = max_len - len(item[1])
+            if num_temp > 0:
+                for _ in range(num_temp):
+                    item[1].append(0)
+            # 在开头和结尾加[CLS] [SEP]
+            item[1] = [101] + item[1] + [102]
+            item[1] = str(item[1])
+            continue
+
+        for _ in range(num):
+            item[1] = item[1] + '[PAD]'
+        item[1] = tokenizer.encode(item[1])
+        num_temp = max_len - len(item[1])
+        if num_temp > 0:
+            for _ in range(num_temp):
+                item[1].append(0)
+        item[1] = [101] + item[1] + [102]
+        item[1] = str(item[1])
+
+    return dataset_list
+
+
+# 计算每个batch的准确率
+def batch_accuracy(pre, label):
+    pre = pre.argmax(dim=1)
+    correct = torch.eq(pre, label).sum().float().item()
+    accuracy = correct / float(len(label))
+
+    return accuracy
+
+
+if __name__ == "__main__":
+
+    # 生成数据集以及迭代器
+    # train_dataset = load_dataset('train.csv', max_len = MAX_LEN)  # 7337 * 3
+    test_dataset = load_dataset('test_data_8.4.csv', max_len=MAX_LEN)  # 7356 * 3
+
+    # train_cus = Custom_dataset(train_dataset)
+    # train_loader = DataLoader(dataset=train_cus, batch_size=BATCH_SIZE, shuffle=True)
+
+    # Bert模型以及相关配置
+    config = BertConfig.from_pretrained('bert-base-chinese', resume_download=True)
+    config.num_labels = 2
+    model = BertForSequenceClassification(config=config)
+    model = BertForSequenceClassification.from_pretrained('bert-base-chinese', config=config)
+
+    optimizer = AdamW(model.parameters(), lr=LR, correct_bias=False)
+    scheduler = WarmupLinearSchedule(optimizer, warmup_steps=WARMUP_STEPS, t_total=T_TOTAL)
+
+    # optimizer = optim.Adam(model.parameters(), lr=LR)
+
+    print('开始加载训练完成的model...')
+    model.load_state_dict(torch.load('90.9847368421052632_bert_cla.ckpt'))
+    print('开始测试...')
+    model.eval()
+    model=model.cuda()
+    test_result = []
+    num=0
+    for item in test_dataset:
+        text_list = list(json.loads(item[1]))
+        text_tensor = torch.tensor(text_list).unsqueeze(0).cuda()
+
+        with torch.no_grad():
+            # print('list', text_list)
+            # print('tensor', text_tensor)
+            # print('tensor.shape', text_tensor.shape)
+            outputs = model(text_tensor, labels=None)
+            num+=1
+            print(outputs[0].softmax(dim=1)[0][0],num)
+            pre = outputs[0].argmax(dim=1)
+            perdl=outputs[0].softmax(dim=1)[0][0]
+            test_result.append([item[0], pre.item(),perdl.item()])
+
+    # 写入csv文件
+    df = pd.DataFrame(test_result)
+    df.to_csv('test_result_8.4.csv', index=False, header=['id', 'label','labeldl'])
+
+    print('测试完成，快提交结果吧')
+
+
